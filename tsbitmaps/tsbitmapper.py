@@ -14,35 +14,37 @@ class TSBitMapper:
     Test data and parameter settings taken from http://alumni.cs.ucr.edu/~wli/SSDBM05/
     """
 
-    def __init__(self, feature_window_size=None, num_bins=5, level_size=3, lag_window_size=None, lead_window_size=None):
+    def __init__(self, feature_window_size=None, num_bins=5, level_size=3, lag_window_size=None, lead_window_size=None,
+                 q=99.7):
 
         """
         
         :param int feature_window_size: should be about the size at which events happen
         :param int num_bins: number of equal-width bins, i.e. symbols, to discretize a time series
         :param int level_size: desired level of recursion of the bitmap
-        :param int lag_window_size: how far to look back
+        :param int lag_window_size: how far to look back, None for supervised learning
         :param int lead_window_size: how far to look ahead
+        :param float in range of [0,100] q: the qth percentile as the threshold for anomalies
         """
-        assert feature_window_size, 'feature_window_size must be given'
-        assert min(lag_window_size,
-                   lead_window_size) >= level_size, 'lag_window_size and lead_window_size must be >= feature_window_size'
+        assert feature_window_size > 0, 'feature_window_size must be a positive integer'
+        assert lead_window_size >= feature_window_size, 'lead_window_size must be >= feature_window_size'
 
         # bitmap parameters
         self.feature_window_size = feature_window_size
+
         self.level_size = level_size
 
-        if lag_window_size is None:
-            self.lag_window_size = 3 * self.feature_window_size
-        else:
-            self.lag_window_size = lag_window_size
+        self.lag_window_size = lag_window_size
+        # if lag_window_size is None:
+        #     self.lag_window_size = 3 * self.feature_window_size
+        # else:
+        #     self.lag_window_size = lag_window_size
 
-        if lead_window_size is None:
-            self.lead_window_size = 2 * self.feature_window_size
-        else:
-            self.lead_window_size = lead_window_size
+        self.lead_window_size = lead_window_size
 
         self.num_bins = num_bins
+        self.q = q
+        self.bitmap_scores = None
 
     def discretize(self, ts, num_bins=None, global_min=None, global_max=None):
         min_value = ts.min()
@@ -70,6 +72,7 @@ class TSBitMapper:
         windows = []
         global_min = ts.min()
         global_max = ts.max()
+
         for i in range(0, n - n % feature_window_size, feature_window_size):
             binned_fw = self.discretize(ts[i: i + feature_window_size], num_bins, global_min, global_max)
             windows.append(binned_fw)
@@ -84,7 +87,7 @@ class TSBitMapper:
         
         :param str chunk: symbol sequence representation of a univariate time series
         :param int level_size: desired level of recursion of the bitmap
-        :return: bitmap representation of the time series
+        :return : bitmap representation of `chunk`
         """
         bitmap = defaultdict(int)
         n = len(chunk)
@@ -105,7 +108,7 @@ class TSBitMapper:
         :param str chunk: symbol sequence representation of a univariate time series
         :param int level_size: desired level of recursion of the bitmap
         :param int step: length of the feature window
-        :return: bitmap representation of the time series
+        :return : bitmap representation of `chunk`
         """
         if step is None:
             step = self.feature_window_size
@@ -131,6 +134,36 @@ class TSBitMapper:
             bitmap[feat] = bitmap[feat] / max_freq
         return bitmap
 
+    def _slide_lead_chunks(self, ts):
+        """
+        In supervised training, the entire training time series as the reference data can be used as the lag window.
+
+        """
+
+        binned_ts = self.discretize_by_feat_window(ts)
+        ts_len = len(binned_ts)
+
+        scores = np.zeros(len(ts))
+
+        leadws = self.lead_window_size
+        featws = self.level_size
+
+        lead_bitmap = self.get_bitmap_with_feat_window(binned_ts[0: leadws])
+        egress_lead_feat = binned_ts[0: featws]
+
+        for i in range(1, ts_len - leadws + 1):
+            lead_chunk = binned_ts[i: i + leadws]
+            ingress_lead_feat = lead_chunk[-featws:]
+
+            lead_bitmap[ingress_lead_feat] += 1
+            lead_bitmap[egress_lead_feat] -= 1
+
+            scores[i] = self.bitmap_distance(self.ref_ts_bitmap, lead_bitmap)
+
+            egress_lead_feat = lead_chunk[0: featws]
+
+        return scores
+
     def _slide_chunks(self, ts):
         lag_bitmap = {}
         lead_bitmap = {}
@@ -146,9 +179,9 @@ class TSBitMapper:
         leadws = self.lead_window_size
         featws = self.level_size
 
-        for i in range(self.lag_window_size, ts_len - self.lead_window_size + 1):
+        for i in range(lagws, ts_len - leadws + 1):
 
-            if i == self.lag_window_size:
+            if i == lagws:
                 lag_chunk = binned_ts[i - lagws: i]
                 lead_chunk = binned_ts[i: i + leadws]
 
@@ -179,11 +212,11 @@ class TSBitMapper:
                 egress_lag_feat = lag_chunk[0: featws]
                 egress_lead_feat = lead_chunk[0: featws]
 
-        self.bitmap_scores = scores
+        return scores
 
     def bitmap_distance(self, lag_bitmap, lead_bitmap):
         """
-        Computes the dissimilarity of two bitmaps
+        Computes the dissimilarity of two bitmaps.
         """
         dist = 0
         lag_feats = set(lag_bitmap.keys())
@@ -203,39 +236,75 @@ class TSBitMapper:
 
     def fit(self, ts):
         """
-        Computes the bitmap distance at each timestamp in a univariate time series `ts`
+        Computes the reference bitmaps of a univariate time series `ts`.
         
         :param ts: 1-D numpy array or pandas.Series 
         
         """
-        assert len(
-            ts) >= self.lag_window_size + self.lead_window_size, 'sequence length must be larger than sum of lag_window_size and lead_window_size'
-        self.ts = ts
-        self._slide_chunks(ts)
+        if self.lag_window_size is None:
+            assert len(ts) >= self.lead_window_size, 'sequence length must be >= than lead_window_size'
+        else:
+            assert len(
+                ts) >= self.lag_window_size + self.lead_window_size, 'sequence length must be >= (lag_window_size + lead_window_size)'
+
+        self.ref_ts = ts
+        self.ref_ts_bitmap = self.get_bitmap_with_feat_window(self.discretize(ts))
+
+    def fit_predict(self, ts):
+        """
+        Unsupervised training of TSBitMaps.
+        
+        :param ts: 1-D numpy array or pandas.Series 
+        :return labels: `+1` for normal observations and `-1` for abnormal observations
+        """
+        assert self.lag_window_size > self.feature_window_size, 'lag_window_size must be >= feature_window_size'
+
+        self.ref_ts = ts
+        scores = self._slide_chunks(ts)
+        self.ref_bitmap_scores = scores
+
+        thres = np.percentile(scores[self.lag_window_size: -self.lead_window_size + 1], self.q)
+
+        labels = np.full(len(ts), 1)
+        for idx, score in enumerate(scores):
+            if score > thres:
+                labels[idx] = -1
+
+        return labels
+
+    def predict(self, ts):
+        """
+        Predict if a time series contains outliers or not.
+        
+        :param ts: 1-D numpy array or pandas.Series 
+        :return: labels: `+1` for normal observations and `-1` for abnormal observations
+        """
+        cur_scores = None
+        labels = np.full(len(ts), 1)
+
+        if (len(self.ref_ts) != len(ts)):
+            cur_scores = self._slide_lead_chunks(ts)
+        elif (np.allclose(self.ref_ts, ts)):
+            labels = self.fit_predict(ts)
+        else:
+            cur_scores = self._slide_lead_chunks(ts)
+
+        if cur_scores is not None:
+            self.bitmap_scores = cur_scores
+
+            thres = np.percentile(cur_scores[0: -self.lead_window_size + 1], self.q)
+
+            for idx, score in enumerate(cur_scores):
+                if score > thres:
+                    labels[idx] = -1
+
+        return labels
 
     def get_bitmap_scores(self):
-        return self.bitmap_scores
+        if self.bitmap_scores is None:
+            return self.ref_bitmap_scores
+        else:
+            return self.bitmap_scores
 
-    def get_anomalies(self, num_std=3):
-        """
-        Get the abnormal scores which are `num_std` standard deviations from the mean score
-        
-        """
-        scores = self.bitmap_scores
-        mean_score = np.mean(scores[self.lag_window_size: -self.lead_window_size])
-        std_score = np.std(scores[self.lag_window_size: -self.lead_window_size])
-
-        upper_threshold = mean_score + num_std * std_score  # num_std standard deviations from the mean score
-
-        inds = []
-        anomalies = []
-        ts_values = []
-
-        for idx, score in enumerate(scores):
-            if score >= upper_threshold:
-                inds.append(idx)
-                anomalies.append(score)
-                ts_values.append(self.ts[idx])
-
-        anomaly_df = pd.DataFrame({'idx': inds, 'abnormal_score': anomalies, 'ts_value': ts_values})
-        return anomaly_df
+    def get_ref_bitmap_scores(self):
+        return self.ref_bitmap_scores
